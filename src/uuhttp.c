@@ -2,167 +2,256 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <setjmp.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-
-#define INDEX_PATH "assets/index.html"
-#define NOT_FOUND_PATH "assets/404.html"
 
 #define SERVER_HOST "127.0.0.1"
 #define SERVER_PORT 8080
 
 #define QUEUE_SIZE 4096
+#define EPOLL_MAX_EVENTS 128
+#define RD_BUF_CHUNK_SIZE 4096
 
-struct content_buffers {
-    char* buf_index;
-    char* buf_not_found;
+#define HANDLE_ERRNO(msg) fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+
+enum HTTP_METHOD {
+    GET     = 0,
+    POST    = 1,
+    PUT     = 2,
+    PATCH   = 3,
+    DELETE  = 4,
+    OPTIONS = 5,
+    TRACE   = 6,
+    HEAD    = 7,
+    CONNECT = 8
 };
 
-char* alloc_from_file(const char* filepath) {
-    FILE* fp = fopen(filepath, "r");
-    if (fp < 0) {
-        fprintf(stderr, "Failed to open '%s': %s\n", filepath, strerror(errno));
+struct http_request {
+    char* path;
+    enum HTTP_METHOD method;
+
+    int _error;
+};
+
+struct http_server {
+    int fd;
+    int ep_fd;
+    struct epoll_event* ep_ev_buf;
+    struct sockaddr_in sa;
+    socklen_t sa_len;
+};
+
+struct http_server* hs_init() {
+    struct http_server* srv = malloc(sizeof(struct http_server));
+    assert(srv != NULL);
+
+    struct sockaddr_in addr = {0};
+
+    addr.sin_addr.s_addr = inet_addr(SERVER_HOST);
+    addr.sin_port = htons(SERVER_PORT);
+    addr.sin_family = AF_INET;
+
+    const int ep_fd = epoll_create1(0);
+    if (ep_fd < 0) {
+        HANDLE_ERRNO("Failed to create epoll instance");
         return NULL;
     }
 
-    struct stat st;
+    struct epoll_event* ep_ev_buf = calloc(EPOLL_MAX_EVENTS, sizeof(struct epoll_event));
+    assert(ep_ev_buf != NULL);
 
-    if (stat(filepath, &st) < 0) {
-        fprintf(stderr, "Failed to get stat for %s: %s\n", filepath, strerror(errno));
-        fclose(fp);
-        return NULL;
+    srv->ep_fd = ep_fd;
+    srv->ep_ev_buf = ep_ev_buf;
+    srv->sa = addr;
+    srv->sa_len = sizeof(addr);
+
+    return srv;
+}
+
+void hs_handle(struct http_server* srv, const struct http_request req) {}
+
+static void hs_conn_read();
+static void hs_conn_write();
+
+static int hs_conn_accept(const struct http_server* srv) {
+    struct sockaddr sa_in;
+    socklen_t sa_in_len;
+
+    const int cfd = accept(srv->fd, &sa_in, &sa_in_len);
+    if (cfd < 0) {
+        HANDLE_ERRNO("Failed to accept connection");
+        return -1;
     }
 
-    const size_t buf_size = st.st_size + 1;
+    struct epoll_event ep_ev = {
+        .events = EPOLLIN | EPOLLET,
+        .data.fd = cfd
+    };
 
-    char* buf = malloc(sizeof(char) * buf_size);
+    if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, cfd, &ep_ev) < 0) {
+        HANDLE_ERRNO("Failed to add entry to the epoll instance");
+        return -1;
+    }
+
+    return 0;
+}
+
+struct http_request http_request_parse(const char* bytes, const size_t size) {
+    struct http_request req = {0};
+
+    char* buf = malloc(size);
     if (!buf) {
-        fclose(fp);
-        return NULL;
+        req._error = 1;
+        return req;
     }
 
-    const size_t bytes_written = fread(buf, sizeof(char), buf_size, fp);
-    if (bytes_written != buf_size-1) {
-        fprintf(stderr, "Failed to read into buffer, wrote %ld/%ld\n", bytes_written, buf_size);
-        fclose(fp);
-        return NULL;
+    for (size_t i = 0; i < size; ++i) {
+        buf[i] = bytes[i];
     }
 
-    // End buffer with content-closing tag.
-    buf[buf_size-1] = '\0';
+    // ...
 
-    return buf;
+    free(buf);
+
+    return req;
 }
 
-struct content_buffers* cb_alloc(const char* index_path) {
-    struct content_buffers* cb = malloc(sizeof(struct content_buffers));
-    assert(cb != NULL);
-
-    cb->buf_index = alloc_from_file(index_path);
-    assert(cb->buf_index != NULL);
-
-    cb->buf_not_found = alloc_from_file(NOT_FOUND_PATH);
-    assert(cb->buf_not_found != NULL);
-
-    return cb;
-}
-
-void cb_free(struct content_buffers* cb) {
-    assert(cb != NULL);
-
-    free(cb->buf_index);
-    free(cb->buf_not_found);
-
-    free(cb);
-}
-
-int serve_content(struct content_buffers* cb) {
-    struct sockaddr_in server_addr = {0};
-
-    server_addr.sin_addr.s_addr = inet_addr(SERVER_HOST);
-    server_addr.sin_port = htons(SERVER_PORT);
-    server_addr.sin_family = AF_INET;
-
-    // Size of the server address struct.
-    socklen_t sa_len = sizeof(server_addr);
-
-    const int server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (server_fd < 0) {
-        fprintf(stderr, "Failed to create socket: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+void hs_serve(struct http_server* srv) {
+    const int sfd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sfd < 0) {
+        HANDLE_ERRNO("Failed to create socket");
+        return;
     }
 
-    int option = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+    const int option = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sa_len) < 0) {
-        fprintf(stderr, "Failed to bind socket: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+    srv->fd = sfd;
+
+    if (bind(sfd, (struct sockaddr*)&srv->sa, srv->sa_len) < 0) {
+        HANDLE_ERRNO("Failed to bind socket");
+        return;
     }
 
-    if (listen(server_fd, QUEUE_SIZE) < 0) {
-        fprintf(stderr, "Failed to listen: %s\n", strerror(errno));
-        return EXIT_FAILURE;
+    if (listen(sfd, QUEUE_SIZE) < 0) {
+        HANDLE_ERRNO("Failed to listen");
+        return;
     }
 
-    printf("Listening on http://%s:%d\n", SERVER_HOST, SERVER_PORT);
+    struct epoll_event ep_ev_in = {
+        .events = EPOLLIN | EPOLLET,
+        .data.fd = sfd
+    };
 
-    while (1) {
-        const int conn_fd = accept(server_fd, (struct sockaddr*)&server_addr, &sa_len);
-        if (conn_fd < 0) {
-            fprintf(stderr, "Failed to accept: %s\n", strerror(errno));
-            return EXIT_FAILURE;
+    if (epoll_ctl(srv->ep_fd, EPOLL_CTL_ADD, sfd, &ep_ev_in) < 0) {
+        HANDLE_ERRNO("Failed to add server fd to the epoll instance");
+        return;
+    }
+
+    int ev_count = 0;
+
+    while (true) {
+        ev_count = epoll_wait(srv->ep_fd, srv->ep_ev_buf, EPOLL_MAX_EVENTS, -1);
+        if (ev_count < 0) {
+            HANDLE_ERRNO("Failed to receive epoll events")
+            break;
         }
 
-        size_t content_length = strlen(cb->buf_index);
+        for (size_t i = 0; i < ev_count; ++i) {
+            const struct epoll_event ev = srv->ep_ev_buf[i];
 
-        const char* response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: %ld\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "%s";
-
-        char response_buffer[300];
-
-        sprintf(response_buffer, response, content_length, cb->buf_index);
-
-        long total = 0;
-        const size_t required = sizeof(response_buffer);
-
-        while (total < required) {
-            const long sent_bytes = send(conn_fd, response_buffer, 300, 0);
-            if (sent_bytes < 0) {
-                fprintf(stderr, "Failed to send: %s\n", strerror(errno));
-                return EXIT_FAILURE;
+            if (ev.events & (EPOLLHUP | EPOLLERR)) {
+                close(ev.data.fd);
+                continue;
             }
 
-            total += sent_bytes;
-        }
+            if (ev.data.fd == srv->fd) {
+                hs_conn_accept(srv);
+                continue;
+            }
 
-        close(conn_fd);
+            size_t payload_size = 0;
+            char* rd_buf = malloc(RD_BUF_CHUNK_SIZE);
+            if (!rd_buf) {
+                fprintf(stderr, "Failed to allocate memory for the read buffer\n");
+                return;
+            };
+
+            int n = 0;
+
+            while (true) {
+                char tmp_buf[RD_BUF_CHUNK_SIZE];
+
+                const ssize_t bytes_rd = recv(ev.data.fd, tmp_buf, RD_BUF_CHUNK_SIZE, 0);
+                if (bytes_rd < 0) {
+                    HANDLE_ERRNO("Failed to receive");
+                    break;
+                }
+
+                if (bytes_rd == 0) {
+                    break;
+                }
+
+                payload_size += bytes_rd;
+                const size_t offset = n * RD_BUF_CHUNK_SIZE;
+
+                for (size_t j = 0; j < bytes_rd; ++j) {
+                    rd_buf[j + offset] = tmp_buf[j];
+                }
+
+                if (bytes_rd < RD_BUF_CHUNK_SIZE) {
+                    break;
+                }
+
+                ++n;
+
+                char* tmp_rd_buf = rd_buf;
+
+                rd_buf = realloc(tmp_rd_buf, (n + 1) * RD_BUF_CHUNK_SIZE);
+                if (!rd_buf) {
+                    free(rd_buf);
+                    fprintf(stderr, "Failed to reallocate memory for the read buffer\n");
+                    return;
+                };
+
+                rd_buf = tmp_rd_buf;
+            }
+
+            const struct http_request req = http_request_parse(rd_buf, payload_size);
+            free(rd_buf);
+
+            if (!req._error) {
+                hs_handle(srv, req);
+            }
+
+            close(ev.data.fd);
+        }
     }
+}
+
+void hs_free(struct http_server* server) {
+    assert(server != NULL);
+
+    close(server->ep_fd);
+
+    free(server->ep_ev_buf);
+    free(server);
 }
 
 int main(const int argc, char **argv) {
-    const char* index_path = INDEX_PATH;
+    struct http_server* srv = hs_init();
+    assert(srv != NULL);
 
-    if (argc > 1) {
-        index_path = argv[1];
-    }
-
-    struct content_buffers* cb = cb_alloc(index_path);
-    assert(cb != NULL);
-
-    serve_content(cb);
-
-    cb_free(cb);
+    hs_serve(srv);
+    hs_free(srv);
 
     return EXIT_SUCCESS;
 }
