@@ -12,6 +12,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <ctype.h>
 
 #define SERVER_HOST "127.0.0.1"
 #define SERVER_PORT 8080
@@ -20,18 +21,23 @@
 #define EPOLL_MAX_EVENTS 128
 #define RD_BUF_CHUNK_SIZE 4096
 
+#define HTTP_REQ_ERR    1
+#define HTTP_REQ_NO_ERR 0
+
 #define HANDLE_ERRNO(msg) fprintf(stderr, "%s: %s\n", msg, strerror(errno));
 
 enum HTTP_METHOD {
-    GET     = 0,
-    POST    = 1,
-    PUT     = 2,
-    PATCH   = 3,
-    DELETE  = 4,
-    OPTIONS = 5,
-    TRACE   = 6,
-    HEAD    = 7,
-    CONNECT = 8
+    HM_GET     = 0,
+    HM_POST    = 1,
+    HM_PUT     = 2,
+    HM_PATCH   = 3,
+    HM_DELETE  = 4,
+    HM_OPTIONS = 5,
+    HM_TRACE   = 6,
+    HM_HEAD    = 7,
+    HM_CONNECT = 8,
+
+    HM_UNKNOWN = -1
 };
 
 struct http_request {
@@ -76,7 +82,9 @@ struct http_server* hs_init() {
     return srv;
 }
 
-void hs_handle(struct http_server* srv, const struct http_request req) {}
+void hs_handle(struct http_server* srv, const struct http_request req) {
+    printf("Get request with %d method and |%s| path\n", req.method, req.path);
+}
 
 static void hs_conn_read();
 static void hs_conn_write();
@@ -104,22 +112,99 @@ static int hs_conn_accept(const struct http_server* srv) {
     return 0;
 }
 
-struct http_request http_request_parse(const char* bytes, const size_t size) {
-    struct http_request req = {0};
+enum HTTP_PART {
+    HP_REQUEST_LINE = 0,
+    HP_HEADER       = 1,
+    HP_BODY         = 2
+};
 
-    char* buf = malloc(size);
-    if (!buf) {
-        req._error = 1;
-        return req;
-    }
+enum HTTP_STATE {
+    HS_RL_METHOD  = 0,
+    HS_RL_PATH    = 1,
+    HS_RL_VERSION = 2
+};
+
+/*
+ * Get method from the string bytes with assumption that method will be in range
+ * from bytes[0] to bytes[n].
+ */
+static enum HTTP_METHOD get_method(const char* bytes, const size_t n) {
+    if (n >= 3 && !strncmp(bytes, "GET", n)) return HM_GET;
+    if (n >= 4 && !strncmp(bytes, "POST", n)) return HM_POST;
+    if (n >= 3 && !strncmp(bytes, "PUT", n)) return HM_PUT;
+    if (n >= 5 && !strncmp(bytes, "PATCH", n)) return HM_PATCH;
+    if (n >= 6 && !strncmp(bytes, "DELETE", n)) return HM_DELETE;
+    if (n >= 7 && !strncmp(bytes, "OPTIONS", n)) return HM_OPTIONS;
+    if (n >= 5 && !strncmp(bytes, "TRACE", n)) return HM_TRACE;
+    if (n >= 4 && !strncmp(bytes, "HEAD", n)) return HM_HEAD;
+
+    return HM_UNKNOWN;
+}
+
+/*
+ * Parse HTTP/1.1 request bytes to the struct http_request.
+ */
+struct http_request http_request_parse(const char* bytes, const size_t size) {
+    struct http_request req;
+    memset(&req, 0, sizeof(struct http_request));
+
+    // Predefine error so we can return request with error more conveniently.
+    req._error = HTTP_REQ_ERR;
+
+    enum HTTP_PART part   = HP_REQUEST_LINE;
+    enum HTTP_STATE state = HS_RL_METHOD;
+
+    size_t last_state = 0;
 
     for (size_t i = 0; i < size; ++i) {
-        buf[i] = bytes[i];
+        char ch = bytes[i];
+
+        switch (part) {
+        case HP_REQUEST_LINE:
+            if (!isspace(ch)) continue;
+
+            switch (state) {
+            case HS_RL_METHOD:
+                const enum HTTP_METHOD method = get_method(bytes, i);
+                if (method == HM_UNKNOWN) {
+                    fprintf(stderr, "Failed to parse request method\n");
+                    return req;
+                }
+
+                state = HS_RL_PATH;
+                last_state = i;
+                req.method = method;
+                break;
+            case HS_RL_PATH:
+                size_t cap = i - last_state - 1;
+                if (cap <= 0) {
+                    fprintf(stderr, "Invalid request path capacity: %d\n", cap);
+                    return req;
+                }
+
+                char* path = malloc(cap);
+                if (!path) {
+                    fprintf(stderr, "Failed to allocate memory for the request path\n");
+                    return req;
+                }
+
+                memcpy(path, bytes + last_state + 1, cap);
+
+                state = HS_RL_VERSION;
+                last_state = i;
+                req.path = path;
+                break;
+            case HS_RL_VERSION:
+                // ...                
+                break;
+            }
+            break;
+        }
+
+        // TODO: handle other request parts.
     }
 
-    // ...
-
-    free(buf);
+    req._error = HTTP_REQ_NO_ERR;
 
     return req;
 }
@@ -203,6 +288,7 @@ void hs_serve(struct http_server* srv) {
                 payload_size += bytes_rd;
                 const size_t offset = n * RD_BUF_CHUNK_SIZE;
 
+                // Copy temporary buffer to the actual read buffer.
                 for (size_t j = 0; j < bytes_rd; ++j) {
                     rd_buf[j + offset] = tmp_buf[j];
                 }
@@ -215,6 +301,8 @@ void hs_serve(struct http_server* srv) {
 
                 char* tmp_rd_buf = rd_buf;
 
+                // If there is more data to read and we out of the read buffer capacity
+                // then we should reallocate with more memory (2x of RD_BUF_CHUNK_SIZE).
                 rd_buf = realloc(tmp_rd_buf, (n + 1) * RD_BUF_CHUNK_SIZE);
                 if (!rd_buf) {
                     free(rd_buf);
@@ -228,7 +316,7 @@ void hs_serve(struct http_server* srv) {
             const struct http_request req = http_request_parse(rd_buf, payload_size);
             free(rd_buf);
 
-            if (!req._error) {
+            if (req._error == HTTP_REQ_NO_ERR) {
                 hs_handle(srv, req);
             }
 
